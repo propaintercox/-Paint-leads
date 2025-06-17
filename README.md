@@ -1,1 +1,96 @@
-# -Paint-leads
+# -Paint-leadsimport os
+import requests
+from bs4 import BeautifulSoup
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import smtplib
+from email.mime.text import MIMEText
+from datetime import datetime
+import feedparser
+
+# ===== CONFIGURATION =====
+CRAWL_SITES = [
+    {"name": "Craigslist Myrtle Beach", "type": "craigslist", "url": "https://myrtlebeach.craigslist.org/search/hss?query=painting"},
+    {"name": "Reddit r/myrtlebeach", "type": "reddit", "url": "https://www.reddit.com/r/myrtlebeach/search.rss?q=painter&restrict_sr=1&sort=new"},
+    {"name": "Reddit r/homeimprovement", "type": "reddit", "url": "https://www.reddit.com/r/homeimprovement/search.rss?q=painter&restrict_sr=1&sort=new"},
+    {"name": "Facebook Marketplace RSS", "type": "feed", "url": os.getenv("FB_MARKETPLACE_RSS")},
+]
+GOOGLE_SHEET_NAME = "Painting Leads"
+EMAIL_USER = os.getenv("GMAIL_USER")
+EMAIL_PASS = os.getenv("GMAIL_PASS")
+ALERT_RECIPIENT = os.getenv("ALERT_RECIPIENT", EMAIL_USER)
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")  # Optional
+
+# Sheets setup
+scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+sheet = gspread.authorize(creds).open(GOOGLE_SHEET_NAME).sheet1
+
+def send_email(subject, html):
+    msg = MIMEText(html, "html")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_USER
+    msg["To"] = ALERT_RECIPIENT
+    s = smtplib.SMTP_SSL("smtp.gmail.com", 465)
+    s.login(EMAIL_USER, EMAIL_PASS)
+    s.sendmail(EMAIL_USER, [ALERT_RECIPIENT], msg.as_string())
+    s.quit()
+
+def send_slack(message):
+    if not SLACK_WEBHOOK: return
+    requests.post(SLACK_WEBHOOK, json={"text": message})
+
+def row_exists(link):
+    rows = sheet.findall(link)
+    return len(rows) > 0
+
+def parse_craigslist(url, name):
+    out = []
+    resp = requests.get(url, headers={"User-Agent":"Mozilla/5.0"})
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for li in soup.select("li.result-row")[:10]:
+        a = li.select_one("a.result-title")
+        link, title = a["href"], a.get_text()
+        date = li.select_one("time")["datetime"] if li.select_one("time") else datetime.now().isoformat()
+        teaser = li.get_text()[:200]
+        out.append((name, date, title, link, teaser))
+    return out
+
+def parse_reddit_feed(url, name):
+    out = []
+    feed = feedparser.parse(url)
+    for e in feed.entries[:10]:
+        title, link, date = e.title, e.link, e.published
+        summary = e.summary[:200]
+        out.append((name, date, title, link, summary))
+    return out
+
+def parse_feed(url, name):
+    return parse_reddit_feed(url, name)
+
+def scrape_all():
+    new = []
+    for site in CRAWL_SITES:
+        if site["type"] == "craigslist":
+            results = parse_craigslist(site["url"], site["name"])
+        else:
+            results = parse_feed(site["url"], site["name"])
+        for entry in results:
+            _, _, _, link, _ = entry
+            if not row_exists(link):
+                sheet.append_row(entry)
+                new.append(entry)
+    return new
+
+def main():
+    leads = scrape_all()
+    if not leads: return
+    html = "<h2>New Painting Leads</h2><ul>"
+    for src, date, title, link, _ in leads:
+        html += f"<li><b>{src}</b> — <a href='{link}'>{title}</a> — {date}</li>"
+    html += "</ul>"
+    send_email("New Painting Leads", html)
+    send_slack(f"📌 {len(leads)} new painting lead(s) just found.")
+
+if __name__ == "__main__":
+    main()
